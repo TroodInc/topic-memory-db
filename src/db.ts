@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type {
   StoredPost,
   StoredArticle,
+  ArticleExtractionJob,
   StoredEmbedding,
   StoredTopic,
   TopicArticleLink,
@@ -15,8 +16,64 @@ import type {
 /** Embedding dimension for text-embedding-3-small */
 const EMBEDDING_DIM = 1536;
 
-const SCHEMA = `
+function assertFiniteVector(vector: number[], label: string): number[] {
+  if (vector.length !== EMBEDDING_DIM) {
+    throw new Error(`${label} must have length ${EMBEDDING_DIM}, got ${vector.length}`);
+  }
+
+  for (let i = 0; i < vector.length; i++) {
+    const value = vector[i];
+    if (!Number.isFinite(value)) {
+      throw new Error(`${label} contains non-finite value at index ${i}`);
+    }
+  }
+
+  return vector;
+}
+
+function parseVector(value: unknown, label: string): number[] {
+  if (Array.isArray(value)) {
+    return assertFiniteVector(value.map((item) => Number(item)), label);
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
+      throw new Error(`${label} has invalid vector format`);
+    }
+
+    const parsed = trimmed
+      .slice(1, -1)
+      .split(",")
+      .map((item) => Number(item.trim()));
+    return assertFiniteVector(parsed, label);
+  }
+
+  throw new Error(`${label} has unsupported vector type`);
+}
+
+function normalizeTimestamp(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (/^\d+$/.test(trimmed)) {
+      const parsedNumber = Number(trimmed);
+      return Number.isFinite(parsedNumber) ? parsedNumber : null;
+    }
+    const parsedDate = Date.parse(trimmed);
+    return Number.isNaN(parsedDate) ? null : parsedDate;
+  }
+  return null;
+}
+
+const EXTENSIONS = `
   CREATE EXTENSION IF NOT EXISTS vector;
+  CREATE EXTENSION IF NOT EXISTS pgcrypto;
+`;
+
+const SCHEMA = `
 
   CREATE TABLE IF NOT EXISTS posts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -39,6 +96,21 @@ const SCHEMA = `
     word_count INTEGER NOT NULL,
     processed_at BIGINT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS article_extraction_queue (
+    url TEXT PRIMARY KEY,
+    post_id UUID NOT NULL REFERENCES posts(id),
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    next_attempt_at BIGINT NOT NULL,
+    last_attempt_at BIGINT,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_article_extraction_queue_next_attempt
+    ON article_extraction_queue (status, next_attempt_at);
 
   CREATE TABLE IF NOT EXISTS embeddings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -131,6 +203,7 @@ export class TopicMemoryDB {
     if (this.initialized) return;
     const client = await this.pool.connect();
     try {
+      await client.query(EXTENSIONS);
       await pgvector.registerTypes(client);
       await client.query(SCHEMA);
     } finally {
@@ -242,6 +315,60 @@ export class TopicMemoryDB {
     return rows.map((r: Record<string, unknown>) => this.mapArticle(r));
   }
 
+  async enqueueArticleExtractionJob(job: Pick<ArticleExtractionJob, "url" | "postId">): Promise<void> {
+    const now = Date.now();
+    await this.pool.query(
+      `INSERT INTO article_extraction_queue
+         (url, post_id, status, attempt_count, last_error, next_attempt_at, last_attempt_at, created_at, updated_at)
+       VALUES ($1, $2, 'pending', 0, NULL, $3, NULL, $3, $3)
+       ON CONFLICT (url) DO UPDATE SET
+         post_id = EXCLUDED.post_id,
+         status = CASE WHEN article_extraction_queue.status = 'failed' THEN 'pending' ELSE article_extraction_queue.status END,
+         next_attempt_at = LEAST(article_extraction_queue.next_attempt_at, EXCLUDED.next_attempt_at),
+         updated_at = EXCLUDED.updated_at`,
+      [job.url, job.postId, now]
+    );
+  }
+
+  async getPendingArticleExtractionJobs(limit = 100): Promise<ArticleExtractionJob[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM article_extraction_queue
+       WHERE status IN ('pending', 'retry') AND next_attempt_at <= $1
+       ORDER BY next_attempt_at ASC, created_at ASC
+       LIMIT $2`,
+      [Date.now(), limit]
+    );
+    return rows.map((row: Record<string, unknown>) => this.mapArticleExtractionJob(row));
+  }
+
+  async recordArticleExtractionFailure(url: string, lastError: string): Promise<void> {
+    const { rows } = await this.pool.query(
+      "SELECT attempt_count FROM article_extraction_queue WHERE url = $1",
+      [url]
+    );
+    if (rows.length === 0) return;
+
+    const now = Date.now();
+    const attemptCount = Number(rows[0].attempt_count) + 1;
+    const status: ArticleExtractionJob["status"] = attemptCount >= 5 ? "failed" : "retry";
+    const nextAttemptAt = now + this.articleExtractionBackoffMs(attemptCount);
+    await this.pool.query(
+      `UPDATE article_extraction_queue
+       SET status = $2,
+           attempt_count = $3,
+           last_error = $4,
+           next_attempt_at = $5,
+           last_attempt_at = $6,
+           updated_at = $6
+       WHERE url = $1`,
+      [url, status, attemptCount, lastError, nextAttemptAt, now]
+    );
+  }
+
+  async completeArticleExtractionJob(url: string): Promise<void> {
+    await this.pool.query("DELETE FROM article_extraction_queue WHERE url = $1", [url]);
+  }
+
   /** Update article summary */
   async updateArticleSummary(articleId: string, summary: string): Promise<void> {
     await this.pool.query("UPDATE articles SET summary = $1 WHERE id = $2", [summary, articleId]);
@@ -253,7 +380,7 @@ export class TopicMemoryDB {
   async insertEmbedding(embedding: Omit<StoredEmbedding, "id" | "createdAt">): Promise<StoredEmbedding> {
     const id = randomUUID();
     const now = Date.now();
-    const vecLiteral = pgvector.toSql(embedding.embedding);
+    const vecLiteral = pgvector.toSql(assertFiniteVector(embedding.embedding, "embedding"));
     await this.pool.query(
       `INSERT INTO embeddings (id, article_id, embedding, model, created_at)
        VALUES ($1, $2, $3, $4, $5)
@@ -290,7 +417,7 @@ export class TopicMemoryDB {
     queryEmbedding: number[],
     k = 5
   ): Promise<Array<StoredEmbedding & { distance: number }>> {
-    const vecLiteral = pgvector.toSql(queryEmbedding);
+    const vecLiteral = pgvector.toSql(assertFiniteVector(queryEmbedding, "queryEmbedding"));
     const { rows } = await this.pool.query(
       `SELECT *, embedding <=> $1 AS distance
        FROM embeddings
@@ -309,7 +436,9 @@ export class TopicMemoryDB {
   /** Insert or update a topic */
   async upsertTopic(topic: Omit<StoredTopic, "createdAt" | "updatedAt">): Promise<StoredTopic> {
     const now = Date.now();
-    const vecLiteral = pgvector.toSql(topic.centroidEmbedding);
+    const vecLiteral = pgvector.toSql(
+      assertFiniteVector(topic.centroidEmbedding, `topic centroid for ${topic.name}`)
+    );
     await this.pool.query(
       `INSERT INTO topics (id, name, description, centroid_embedding, article_count, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -355,12 +484,13 @@ export class TopicMemoryDB {
   async insertContentPlanItem(item: Omit<ContentPlanItem, "id" | "createdAt" | "updatedAt">): Promise<ContentPlanItem> {
     const id = randomUUID();
     const now = Date.now();
+    const scheduledDate = normalizeTimestamp(item.scheduledDate);
     await this.pool.query(
       `INSERT INTO content_plan (id, topic_id, status, priority, human_comment, scheduled_date, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [id, item.topicId, item.status, item.priority, item.humanComment || null, item.scheduledDate || null, now, now]
+      [id, item.topicId, item.status, item.priority, item.humanComment || null, scheduledDate, now, now]
     );
-    return { id, ...item, createdAt: now, updatedAt: now };
+    return { id, ...item, scheduledDate: scheduledDate ?? undefined, createdAt: now, updatedAt: now };
   }
 
   /** Update content plan item status */
@@ -379,6 +509,12 @@ export class TopicMemoryDB {
     if (current.rows.length === 0) return;
 
     const row = current.rows[0] as Record<string, unknown>;
+    const scheduledDate =
+      updates.scheduledDate !== undefined
+        ? normalizeTimestamp(updates.scheduledDate)
+        : row.scheduled_date
+          ? Number(row.scheduled_date)
+          : null;
     await this.pool.query(
       `UPDATE content_plan
        SET status = $1,
@@ -391,7 +527,7 @@ export class TopicMemoryDB {
         updates.status ?? (row.status as ContentPlanItem["status"]),
         updates.priority ?? Number(row.priority),
         updates.humanComment ?? ((row.human_comment as string) || null),
-        updates.scheduledDate ?? (row.scheduled_date ? Number(row.scheduled_date) : null),
+        scheduledDate,
         Date.now(),
         id,
       ]
@@ -524,6 +660,10 @@ export class TopicMemoryDB {
     await this.pool.end();
   }
 
+  private articleExtractionBackoffMs(attemptCount: number): number {
+    return Math.min(24 * 60 * 60 * 1000, 5 * 60 * 1000 * 2 ** Math.max(0, attemptCount - 1));
+  }
+
   // --- Mapping helpers ---
 
   private mapPost(row: Record<string, unknown>): StoredPost {
@@ -551,11 +691,25 @@ export class TopicMemoryDB {
     };
   }
 
+  private mapArticleExtractionJob(row: Record<string, unknown>): ArticleExtractionJob {
+    return {
+      url: row.url as string,
+      postId: row.post_id as string,
+      status: row.status as ArticleExtractionJob["status"],
+      attemptCount: Number(row.attempt_count),
+      lastError: (row.last_error as string) || undefined,
+      nextAttemptAt: Number(row.next_attempt_at),
+      lastAttemptAt: row.last_attempt_at ? Number(row.last_attempt_at) : undefined,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
   private mapEmbedding(row: Record<string, unknown>): StoredEmbedding {
     return {
       id: row.id as string,
       articleId: row.article_id as string,
-      embedding: row.embedding as number[],
+      embedding: parseVector(row.embedding, `embedding ${row.id as string}`),
       model: row.model as string,
       createdAt: Number(row.created_at),
     };
@@ -566,7 +720,7 @@ export class TopicMemoryDB {
       id: row.id as string,
       name: row.name as string,
       description: row.description as string,
-      centroidEmbedding: row.centroid_embedding as number[],
+      centroidEmbedding: parseVector(row.centroid_embedding, `topic centroid ${row.id as string}`),
       articleCount: row.article_count as number,
       createdAt: Number(row.created_at),
       updatedAt: Number(row.updated_at),

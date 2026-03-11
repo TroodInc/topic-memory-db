@@ -21,6 +21,18 @@ export interface StoredArticle {
   processedAt: number;
 }
 
+export interface ArticleExtractionJob {
+  url: string;
+  postId: string;
+  status: "pending" | "retry" | "failed";
+  attemptCount: number;
+  lastError?: string;
+  nextAttemptAt: number;
+  lastAttemptAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 /** An embedding vector stored in the database */
 export interface StoredEmbedding {
   id: string;

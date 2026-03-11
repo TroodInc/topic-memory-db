@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/topic-memory-db",
+  "name": "@contentengine/topic-memory-db",
   "version": "0.1.0",
   "description": "Semantic topic memory database for AI content pipelines",
   "type": "module",
