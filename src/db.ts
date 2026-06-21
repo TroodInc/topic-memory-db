@@ -73,8 +73,10 @@ function normalizeTimestamp(value: unknown): number | null {
 }
 
 const EXTENSIONS = `
-  CREATE EXTENSION IF NOT EXISTS vector;
+  CREATE SCHEMA IF NOT EXISTS content_engine;
+  CREATE EXTENSION IF NOT EXISTS vector SCHEMA public;
   CREATE EXTENSION IF NOT EXISTS pgcrypto;
+  SET search_path TO content_engine, public;
 `;
 
 const SCHEMA = `
@@ -254,7 +256,12 @@ export class TopicMemoryDB {
   private initialized = false;
 
   constructor(connectionString: string) {
-    this.pool = new pg.Pool({ connectionString });
+    this.pool = new pg.Pool({
+      connectionString,
+      // Ensure every connection in the pool uses the content_engine schema.
+      // public is kept so pgvector types (vector) remain resolvable.
+      options: '-csearch_path=content_engine,public',
+    });
   }
 
   /** Initialize schema and register pgvector type. Call once before use. */
