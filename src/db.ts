@@ -11,6 +11,10 @@ import type {
   ContentPlanItem,
   PublishedArticle,
   DraftArticle,
+  StoredSource,
+  StoredInterest,
+  ArticleInterest,
+  ArticleFeedback,
 } from "./types.js";
 
 /** Embedding dimension for text-embedding-3-small */
@@ -86,16 +90,71 @@ const SCHEMA = `
     UNIQUE(telegram_id, channel_id)
   );
 
+  CREATE TABLE IF NOT EXISTS sources (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    url TEXT NOT NULL UNIQUE,
+    adapter_type TEXT NOT NULL,
+    adapter_config JSONB NOT NULL DEFAULT '{}',
+    interest_ids JSONB NOT NULL DEFAULT '[]',
+    last_ingested_at BIGINT,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS interests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    embedding vector(${EMBEDDING_DIM}) NOT NULL,
+    created_at BIGINT NOT NULL,
+    updated_at BIGINT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_interests_embedding
+    ON interests USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 10);
+
   CREATE TABLE IF NOT EXISTS articles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    post_id UUID NOT NULL REFERENCES posts(id),
+    post_id UUID REFERENCES posts(id),
+    source_id UUID REFERENCES sources(id),
+    external_id TEXT,
     url TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
     content TEXT NOT NULL,
     summary TEXT,
     word_count INTEGER NOT NULL,
+    published_at BIGINT,
     processed_at BIGINT NOT NULL
   );
+
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_source_external
+    ON articles (source_id, external_id)
+    WHERE source_id IS NOT NULL AND external_id IS NOT NULL;
+
+  CREATE TABLE IF NOT EXISTS article_interests (
+    article_id UUID NOT NULL REFERENCES articles(id),
+    interest_id UUID NOT NULL REFERENCES interests(id),
+    score DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (article_id, interest_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_article_interests_interest
+    ON article_interests (interest_id, score DESC);
+
+  CREATE TABLE IF NOT EXISTS article_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id TEXT NOT NULL,
+    article_id UUID NOT NULL REFERENCES articles(id),
+    interest_id UUID REFERENCES interests(id),
+    signal TEXT NOT NULL CHECK (signal IN ('like', 'less', 'skip')),
+    created_at BIGINT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_article_feedback_user
+    ON article_feedback (user_id, created_at DESC);
 
   CREATE TABLE IF NOT EXISTS article_extraction_queue (
     url TEXT PRIMARY KEY,
@@ -261,21 +320,43 @@ export class TopicMemoryDB {
 
   // --- Articles ---
 
-  /** Insert an article. Returns null if URL already exists. */
+  /** Insert an article. Returns null if URL or (source_id, external_id) already exists. */
   async insertArticle(article: Omit<StoredArticle, "id" | "processedAt">): Promise<StoredArticle | null> {
     const id = randomUUID();
     const now = Date.now();
     try {
       await this.pool.query(
-        `INSERT INTO articles (id, post_id, url, title, content, summary, word_count, processed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-        [id, article.postId, article.url, article.title, article.content, article.summary || null, article.wordCount, now]
+        `INSERT INTO articles
+           (id, post_id, source_id, external_id, url, title, content, summary, word_count, published_at, processed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          id,
+          article.postId ?? null,
+          article.sourceId ?? null,
+          article.externalId ?? null,
+          article.url,
+          article.title,
+          article.content,
+          article.summary ?? null,
+          article.wordCount,
+          article.publishedAt ?? null,
+          now,
+        ]
       );
       return { id, ...article, processedAt: now };
     } catch (e: unknown) {
       if (e instanceof Error && e.message.includes("duplicate key")) return null;
       throw e;
     }
+  }
+
+  /** Check if an article with (source_id, external_id) already exists */
+  async hasArticleByExternalId(sourceId: string, externalId: string): Promise<boolean> {
+    const { rows } = await this.pool.query(
+      "SELECT 1 FROM articles WHERE source_id = $1 AND external_id = $2",
+      [sourceId, externalId]
+    );
+    return rows.length > 0;
   }
 
   /** Check if an article with the given URL already exists */
@@ -655,6 +736,141 @@ export class TopicMemoryDB {
     );
   }
 
+  // --- Sources ---
+
+  async upsertSource(source: Omit<StoredSource, "id" | "createdAt" | "updatedAt"> & { id?: string }): Promise<StoredSource> {
+    const id = source.id ?? randomUUID();
+    const now = Date.now();
+    await this.pool.query(
+      `INSERT INTO sources (id, name, url, adapter_type, adapter_config, interest_ids, last_ingested_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (url) DO UPDATE SET
+         name = EXCLUDED.name,
+         adapter_type = EXCLUDED.adapter_type,
+         adapter_config = EXCLUDED.adapter_config,
+         interest_ids = EXCLUDED.interest_ids,
+         updated_at = EXCLUDED.updated_at`,
+      [id, source.name, source.url, source.adapterType, JSON.stringify(source.adapterConfig),
+       JSON.stringify(source.interestIds), source.lastIngestedAt ?? null, now, now]
+    );
+    const { rows } = await this.pool.query("SELECT * FROM sources WHERE url = $1", [source.url]);
+    return this.mapSource(rows[0]);
+  }
+
+  async getSourceById(id: string): Promise<StoredSource | null> {
+    const { rows } = await this.pool.query("SELECT * FROM sources WHERE id = $1", [id]);
+    return rows.length > 0 ? this.mapSource(rows[0]) : null;
+  }
+
+  async getAllSources(): Promise<StoredSource[]> {
+    const { rows } = await this.pool.query("SELECT * FROM sources ORDER BY created_at DESC");
+    return rows.map((r: Record<string, unknown>) => this.mapSource(r));
+  }
+
+  async touchSourceIngestedAt(id: string): Promise<void> {
+    await this.pool.query(
+      "UPDATE sources SET last_ingested_at = $1, updated_at = $1 WHERE id = $2",
+      [Date.now(), id]
+    );
+  }
+
+  // --- Interests ---
+
+  async upsertInterest(interest: Omit<StoredInterest, "id" | "createdAt" | "updatedAt"> & { id?: string }): Promise<StoredInterest> {
+    const id = interest.id ?? randomUUID();
+    const now = Date.now();
+    const vecLiteral = pgvector.toSql(assertFiniteVector(interest.embedding, `interest ${interest.slug}`));
+    await this.pool.query(
+      `INSERT INTO interests (id, slug, name, description, embedding, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (slug) DO UPDATE SET
+         name = EXCLUDED.name,
+         description = EXCLUDED.description,
+         embedding = EXCLUDED.embedding,
+         updated_at = EXCLUDED.updated_at`,
+      [id, interest.slug, interest.name, interest.description, vecLiteral, now, now]
+    );
+    const { rows } = await this.pool.query("SELECT * FROM interests WHERE slug = $1", [interest.slug]);
+    return this.mapInterest(rows[0]);
+  }
+
+  async getAllInterests(): Promise<StoredInterest[]> {
+    const { rows } = await this.pool.query("SELECT * FROM interests ORDER BY name ASC");
+    return rows.map((r: Record<string, unknown>) => this.mapInterest(r));
+  }
+
+  async getInterestBySlug(slug: string): Promise<StoredInterest | null> {
+    const { rows } = await this.pool.query("SELECT * FROM interests WHERE slug = $1", [slug]);
+    return rows.length > 0 ? this.mapInterest(rows[0]) : null;
+  }
+
+  // --- Article–Interest matching ---
+
+  async upsertArticleInterest(link: ArticleInterest): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO article_interests (article_id, interest_id, score)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (article_id, interest_id) DO UPDATE SET score = EXCLUDED.score`,
+      [link.articleId, link.interestId, link.score]
+    );
+  }
+
+  /** Return articles for an interest, ranked by score then recency, with user feedback applied. */
+  async getFeedForInterest(
+    interestId: string,
+    options: { limit?: number; offset?: number; userId?: string } = {}
+  ): Promise<Array<StoredArticle & { score: number }>> {
+    const { limit = 20, offset = 0, userId } = options;
+
+    // Exclude articles the user flagged "less" in the past 30 days
+    const suppressClause = userId
+      ? `AND a.id NOT IN (
+           SELECT article_id FROM article_feedback
+           WHERE user_id = $4 AND signal = 'less'
+             AND created_at > ${Date.now() - 30 * 24 * 60 * 60 * 1000}
+         )`
+      : "";
+
+    const params: unknown[] = [interestId, limit, offset];
+    if (userId) params.push(userId);
+
+    const { rows } = await this.pool.query(
+      `SELECT a.*, ai.score
+       FROM articles a
+       JOIN article_interests ai ON ai.article_id = a.id
+       WHERE ai.interest_id = $1
+         ${suppressClause}
+       ORDER BY ai.score DESC, COALESCE(a.published_at, a.processed_at) DESC
+       LIMIT $2 OFFSET $3`,
+      params
+    );
+    return rows.map((r: Record<string, unknown>) => ({
+      ...this.mapArticle(r),
+      score: r.score as number,
+    }));
+  }
+
+  async getArticlesWithoutInterestScores(): Promise<StoredArticle[]> {
+    const { rows } = await this.pool.query(
+      `SELECT a.* FROM articles a
+       LEFT JOIN article_interests ai ON ai.article_id = a.id
+       WHERE ai.article_id IS NULL AND a.summary IS NOT NULL`
+    );
+    return rows.map((r: Record<string, unknown>) => this.mapArticle(r));
+  }
+
+  // --- Feedback ---
+
+  async insertFeedback(feedback: Omit<ArticleFeedback, "id" | "createdAt">): Promise<void> {
+    const id = randomUUID();
+    const now = Date.now();
+    await this.pool.query(
+      `INSERT INTO article_feedback (id, user_id, article_id, interest_id, signal, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, feedback.userId, feedback.articleId, feedback.interestId ?? null, feedback.signal, now]
+    );
+  }
+
   /** Close the connection pool */
   async close(): Promise<void> {
     await this.pool.end();
@@ -681,13 +897,42 @@ export class TopicMemoryDB {
   private mapArticle(row: Record<string, unknown>): StoredArticle {
     return {
       id: row.id as string,
-      postId: row.post_id as string,
+      postId: (row.post_id as string) || undefined,
+      sourceId: (row.source_id as string) || undefined,
+      externalId: (row.external_id as string) || undefined,
       url: row.url as string,
       title: row.title as string,
       content: row.content as string,
       summary: (row.summary as string) || undefined,
-      wordCount: row.word_count as number,
+      wordCount: Number(row.word_count),
+      publishedAt: row.published_at ? Number(row.published_at) : undefined,
       processedAt: Number(row.processed_at),
+    };
+  }
+
+  private mapSource(row: Record<string, unknown>): StoredSource {
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      url: row.url as string,
+      adapterType: row.adapter_type as string,
+      adapterConfig: row.adapter_config as Record<string, unknown>,
+      interestIds: row.interest_ids as string[],
+      lastIngestedAt: row.last_ingested_at ? Number(row.last_ingested_at) : undefined,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  private mapInterest(row: Record<string, unknown>): StoredInterest {
+    return {
+      id: row.id as string,
+      slug: row.slug as string,
+      name: row.name as string,
+      description: row.description as string,
+      embedding: parseVector(row.embedding, `interest embedding ${row.id as string}`),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
     };
   }
 

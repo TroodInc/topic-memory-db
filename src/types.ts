@@ -12,13 +12,57 @@ export interface StoredPost {
 /** An extracted article stored in the database */
 export interface StoredArticle {
   id: string;
-  postId: string;
+  postId?: string;       // set for Telegram-sourced articles
+  sourceId?: string;     // set for adapter-sourced articles
+  externalId?: string;   // adapter-specific dedup key
   url: string;
   title: string;
   content: string;
   summary?: string;
   wordCount: number;
+  publishedAt?: number;
   processedAt: number;
+}
+
+/** A content source (RSS feed, YouTube channel, API endpoint, etc.) */
+export interface StoredSource {
+  id: string;
+  name: string;
+  url: string;
+  adapterType: string;
+  adapterConfig: Record<string, unknown>;
+  interestIds: string[];
+  lastIngestedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A user-defined interest / topic area */
+export interface StoredInterest {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  embedding: number[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Scored link between an article and an interest */
+export interface ArticleInterest {
+  articleId: string;
+  interestId: string;
+  score: number;
+}
+
+/** User feedback signal on a feed item */
+export interface ArticleFeedback {
+  id: string;
+  userId: string;
+  articleId: string;
+  interestId?: string;
+  signal: "like" | "less" | "skip";
+  createdAt: number;
 }
 
 export interface ArticleExtractionJob {
