@@ -1,5 +1,4 @@
 import pg from "pg";
-import pgvector from "pgvector/pg";
 import { randomUUID } from "node:crypto";
 import type {
   StoredPost,
@@ -36,24 +35,32 @@ function assertFiniteVector(vector: number[], label: string): number[] {
 }
 
 function parseVector(value: unknown, label: string): number[] {
+  // pg returns float8[] as a JS array of numbers directly
   if (Array.isArray(value)) {
     return assertFiniteVector(value.map((item) => Number(item)), label);
   }
-
+  // Fallback: Postgres array literal format {0.1,0.2,...}
   if (typeof value === "string") {
     const trimmed = value.trim();
-    if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) {
-      throw new Error(`${label} has invalid vector format`);
-    }
-
-    const parsed = trimmed
-      .slice(1, -1)
-      .split(",")
-      .map((item) => Number(item.trim()));
-    return assertFiniteVector(parsed, label);
+    const inner = trimmed.startsWith("{") && trimmed.endsWith("}")
+      ? trimmed.slice(1, -1)
+      : trimmed.startsWith("[") && trimmed.endsWith("]")
+        ? trimmed.slice(1, -1)
+        : null;
+    if (!inner) throw new Error(`${label} has invalid vector format`);
+    return assertFiniteVector(inner.split(",").map((x) => Number(x.trim())), label);
   }
-
   throw new Error(`${label} has unsupported vector type`);
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  return normA === 0 || normB === 0 ? 0 : dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 function normalizeTimestamp(value: unknown): number | null {
@@ -74,9 +81,7 @@ function normalizeTimestamp(value: unknown): number | null {
 
 const EXTENSIONS = `
   CREATE SCHEMA IF NOT EXISTS content_engine;
-  CREATE EXTENSION IF NOT EXISTS vector SCHEMA public;
   CREATE EXTENSION IF NOT EXISTS pgcrypto;
-  SET search_path TO content_engine, public;
 `;
 
 const SCHEMA = `
@@ -109,14 +114,10 @@ const SCHEMA = `
     slug TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
-    embedding vector(${EMBEDDING_DIM}) NOT NULL,
+    embedding float8[] NOT NULL,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
   );
-
-  CREATE INDEX IF NOT EXISTS idx_interests_embedding
-    ON interests USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 10);
 
   CREATE TABLE IF NOT EXISTS articles (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -176,20 +177,16 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS embeddings (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     article_id UUID NOT NULL UNIQUE REFERENCES articles(id),
-    embedding vector(${EMBEDDING_DIM}) NOT NULL,
+    embedding float8[] NOT NULL,
     model TEXT NOT NULL,
     created_at BIGINT NOT NULL
   );
-
-  CREATE INDEX IF NOT EXISTS idx_embeddings_vector
-    ON embeddings USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 20);
 
   CREATE TABLE IF NOT EXISTS topics (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
     description TEXT NOT NULL,
-    centroid_embedding vector(${EMBEDDING_DIM}) NOT NULL,
+    centroid_embedding float8[] NOT NULL,
     article_count INTEGER NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL,
     updated_at BIGINT NOT NULL
@@ -258,9 +255,7 @@ export class TopicMemoryDB {
   constructor(connectionString: string) {
     this.pool = new pg.Pool({
       connectionString,
-      // Ensure every connection in the pool uses the content_engine schema.
-      // public is kept so pgvector types (vector) remain resolvable.
-      options: '-csearch_path=content_engine,public',
+      options: '-csearch_path=content_engine',
     });
   }
 
@@ -270,7 +265,6 @@ export class TopicMemoryDB {
     const client = await this.pool.connect();
     try {
       await client.query(EXTENSIONS);
-      await pgvector.registerTypes(client);
       await client.query(SCHEMA);
     } finally {
       client.release();
@@ -468,7 +462,7 @@ export class TopicMemoryDB {
   async insertEmbedding(embedding: Omit<StoredEmbedding, "id" | "createdAt">): Promise<StoredEmbedding> {
     const id = randomUUID();
     const now = Date.now();
-    const vecLiteral = pgvector.toSql(assertFiniteVector(embedding.embedding, "embedding"));
+    const vec = assertFiniteVector(embedding.embedding, "embedding");
     await this.pool.query(
       `INSERT INTO embeddings (id, article_id, embedding, model, created_at)
        VALUES ($1, $2, $3, $4, $5)
@@ -476,7 +470,7 @@ export class TopicMemoryDB {
          embedding = EXCLUDED.embedding,
          model = EXCLUDED.model,
          created_at = EXCLUDED.created_at`,
-      [id, embedding.articleId, vecLiteral, embedding.model, now]
+      [id, embedding.articleId, vec, embedding.model, now]
     );
     return { id, ...embedding, createdAt: now };
   }
@@ -497,26 +491,17 @@ export class TopicMemoryDB {
     return this.mapEmbedding(rows[0]);
   }
 
-  /**
-   * Find the K nearest embeddings to a query vector using pgvector.
-   * Uses cosine distance operator (<=>).
-   */
+  /** Find K nearest embeddings using in-memory cosine similarity (no pgvector needed). */
   async findNearestEmbeddings(
     queryEmbedding: number[],
     k = 5
   ): Promise<Array<StoredEmbedding & { distance: number }>> {
-    const vecLiteral = pgvector.toSql(assertFiniteVector(queryEmbedding, "queryEmbedding"));
-    const { rows } = await this.pool.query(
-      `SELECT *, embedding <=> $1 AS distance
-       FROM embeddings
-       ORDER BY embedding <=> $1
-       LIMIT $2`,
-      [vecLiteral, k]
-    );
-    return rows.map((r: Record<string, unknown>) => ({
-      ...this.mapEmbedding(r),
-      distance: r.distance as number,
-    }));
+    const query = assertFiniteVector(queryEmbedding, "queryEmbedding");
+    const all = await this.getAllEmbeddings();
+    return all
+      .map((e) => ({ ...e, distance: 1 - cosineSimilarity(query, e.embedding) }))
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, k);
   }
 
   // --- Topics ---
@@ -524,9 +509,7 @@ export class TopicMemoryDB {
   /** Insert or update a topic */
   async upsertTopic(topic: Omit<StoredTopic, "createdAt" | "updatedAt">): Promise<StoredTopic> {
     const now = Date.now();
-    const vecLiteral = pgvector.toSql(
-      assertFiniteVector(topic.centroidEmbedding, `topic centroid for ${topic.name}`)
-    );
+    const vec = assertFiniteVector(topic.centroidEmbedding, `topic centroid for ${topic.name}`);
     await this.pool.query(
       `INSERT INTO topics (id, name, description, centroid_embedding, article_count, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -536,7 +519,7 @@ export class TopicMemoryDB {
          centroid_embedding = EXCLUDED.centroid_embedding,
          article_count = EXCLUDED.article_count,
          updated_at = EXCLUDED.updated_at`,
-      [topic.id, topic.name, topic.description, vecLiteral, topic.articleCount, now, now]
+      [topic.id, topic.name, topic.description, vec, topic.articleCount, now, now]
     );
     return { ...topic, createdAt: now, updatedAt: now };
   }
@@ -786,7 +769,7 @@ export class TopicMemoryDB {
   async upsertInterest(interest: Omit<StoredInterest, "id" | "createdAt" | "updatedAt"> & { id?: string }): Promise<StoredInterest> {
     const id = interest.id ?? randomUUID();
     const now = Date.now();
-    const vecLiteral = pgvector.toSql(assertFiniteVector(interest.embedding, `interest ${interest.slug}`));
+    const vec = assertFiniteVector(interest.embedding, `interest ${interest.slug}`);
     await this.pool.query(
       `INSERT INTO interests (id, slug, name, description, embedding, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -795,7 +778,7 @@ export class TopicMemoryDB {
          description = EXCLUDED.description,
          embedding = EXCLUDED.embedding,
          updated_at = EXCLUDED.updated_at`,
-      [id, interest.slug, interest.name, interest.description, vecLiteral, now, now]
+      [id, interest.slug, interest.name, interest.description, vec, now, now]
     );
     const { rows } = await this.pool.query("SELECT * FROM interests WHERE slug = $1", [interest.slug]);
     return this.mapInterest(rows[0]);
